@@ -8,4 +8,6 @@ fn main() {
     for key in &keys {
         println!("{} -- {}", key.comment, key.sha256_fingerprint());
     }
+    let key = &keys[1];
+    agent.sign_data(key, "hello world".as_bytes()).unwrap();
 }
