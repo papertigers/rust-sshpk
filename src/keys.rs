@@ -1,6 +1,6 @@
 use base64;
 use byteorder::{ByteOrder, BigEndian};
-use ring::digest;
+use openssl::hash::{hash, MessageDigest};
 
 #[derive(Debug)]
 pub enum SSHKeyType {
@@ -14,9 +14,15 @@ pub enum SSHKeyType {
 }
 
 #[derive(Debug)]
+pub enum FingerprintType {
+    MD5,
+    SHA256,
+}
+
+#[derive(Debug)]
 pub struct SSHKey {
     pub key_type: SSHKeyType,
-    pub key: Vec<u8>,
+    pub pub_key: Vec<u8>,
     pub comment: String,
 }
 
@@ -27,20 +33,32 @@ impl SSHKey {
         let kb = &bytes[4..(4 + len)];
         let key_type = get_key_type(kb);
 
-        let key = Vec::from(bytes);
+        let pub_key = Vec::from(bytes);
 
         let comment = String::from_utf8(comment.to_owned()).expect("invalid utf8");
 
         SSHKey {
             key_type,
-            key,
+            pub_key,
             comment
         }
     }
 
-    pub fn sha256_fingerprint(&self) -> String {
-        let hash = digest::digest(&digest::SHA256, &self.key);
-        format!("{}:{}", "SHA256", base64::encode(hash.as_ref()))
+    pub fn fingerprint(&self, format: FingerprintType) -> String {
+        match format {
+            FingerprintType::MD5 => {
+                let md5 = hash(MessageDigest::md5(), &self.pub_key).unwrap();
+                let hex: Vec<String> = md5.as_ref().iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect();
+                format!("MD5:{}", hex.join(":"))
+            }
+            FingerprintType::SHA256 => {
+                let sha256 = hash(MessageDigest::sha256(), &self.pub_key).unwrap();
+                format!("{}:{}", "SHA256", base64::encode_config(sha256.as_ref(),
+                    base64::STANDARD_NO_PAD))
+            }
+        }
     }
 }
 

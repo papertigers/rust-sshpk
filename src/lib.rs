@@ -1,9 +1,11 @@
 use std::io;
-use std::io::{BufReader, Error, ErrorKind};
+use std::io::{Error, ErrorKind};
 use std::io::prelude::*;
 use std::path::Path;
 use std::os::unix::net::UnixStream;
 use byteorder::{ByteOrder, BigEndian};
+use openssl::bn::BigNum;
+use openssl::ecdsa::EcdsaSig;
 
 pub mod keys;
 use crate::keys::SSHKey;
@@ -73,7 +75,7 @@ impl SSHAgent {
         // construct the request type + key blob
         let mut req = vec![0, 0, 0, 1, SSH_AGENTC_SIGN_REQUEST];
         let mut key_len = [0; 4];
-        BigEndian::write_u32(&mut key_len, key.key.len()as u32);
+        BigEndian::write_u32(&mut key_len, key.pub_key.len()as u32);
 
         // attach the data being signed
         let mut data_len = [0; 4];
@@ -81,22 +83,22 @@ impl SSHAgent {
         let len = io::copy(&mut data, &mut raw_data)? as usize;
         BigEndian::write_u32(&mut data_len, len as u32);
         // XXX handle flags for key.key_type == rsa
-        let flags = [0; 4];
+        let mut flags = [0; 4];
+        BigEndian::write_u32(&mut flags, 0x02 as u32);
 
         // uint32 + op + uint32 + key length + uint32 + data length
-        let total = 4 + 1 + 4 + key.key.len() + 4 + len;
+        let total = 4 + 1 + 4 + key.pub_key.len() + 4 + len;
         BigEndian::write_u32(&mut req[..4], total as u32);
         req.extend(&key_len);
-        req.extend(&key.key);
+        req.extend(&key.pub_key);
         req.extend(&data_len);
-        req.extend(&raw_data);
+        req.append(&mut raw_data); // consume the vector instead and leave it empty
         req.extend(&flags);
 
         // write the data to the ssh-agent
         self.sock.write_all(&req)?;
 
         // read the response
-        let mut idx = 1;
         let mut sign_res = [0; 4];
         self.sock.read_exact(&mut sign_res)?;
         let sig_len = BigEndian::read_u32(&sign_res) as usize;
@@ -109,12 +111,25 @@ impl SSHAgent {
             _ => Err(Error::new(ErrorKind::Other, "unexpected response from the agent")),
         }?;
 
-        let mut idx = 1;
-        let raw_sig = read_frame(&buf, &mut idx);
-        let encoded = base64::encode(raw_sig);
-
+        let mut idx = 5; // skip uint32 + op
+        let algo = read_frame(&buf, &mut idx);
+        println!("{}", std::str::from_utf8(algo).unwrap());
+        idx += 4; // jump past the uint32 that contains the total length
+        // ecdsa specific... for now
+        let der =  ecdsa_signature(&buf[idx..])?;
+        let encoded = base64::encode(&der);
         Ok(encoded)
     }
+}
+
+/// Read a ecdsa signature from the buffer returned back from the ssh-agent
+fn ecdsa_signature(buf: &[u8]) -> io::Result<Vec<u8>> {
+    let mut idx = 0;
+    let r = read_frame(&buf, &mut idx);
+    let s = read_frame(&buf, &mut idx);
+    let r_big = BigNum::from_slice(r)?;
+    let s_big = BigNum::from_slice(s)?;
+    Ok(EcdsaSig::from_private_components(r_big, s_big)?.to_der()?)
 }
 
 /// Read a frame of data from the ssh-agent and return a refernce to the data.
