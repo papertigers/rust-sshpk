@@ -1,14 +1,21 @@
-use std::io;
-use std::io::{Error, ErrorKind};
-use std::io::prelude::*;
-use std::path::Path;
-use std::os::unix::net::UnixStream;
+use std::{
+    cell::RefCell,
+    io,
+    io::{
+        prelude::*,
+        {Error, ErrorKind},
+    },
+    path::Path,
+    os::unix::net::UnixStream,
+};
 use byteorder::{ByteOrder, BigEndian};
-use openssl::bn::BigNum;
-use openssl::ecdsa::EcdsaSig;
+use openssl::{
+    bn::BigNum,
+    ecdsa::EcdsaSig,
+};
 
 pub mod keys;
-use crate::keys::SSHKey;
+use crate::keys::{AgentIdentity, SSHPubKey};
 
 const SSH_AGENT_FAILURE: u8 = 5;
 const SSH_AGENTC_REQUEST_IDENTITIES: u8 = 11;
@@ -16,10 +23,15 @@ const SSH_AGENT_IDENTITIES_ANSWER: u8 = 12;
 const SSH_AGENTC_SIGN_REQUEST: u8 = 13;
 const SSH_AGENT_SIGN_RESPONSE: u8 = 14;
 
+pub trait HTTPSigner {
+    fn fingerprint(&self, format: keys::FingerprintType) -> String;
+    fn sign_data<R: Read>(&self, data: R) -> io::Result<(String)>;
+}
+
 /// Provides an interface to a user's ssh-agent
 #[derive(Debug)]
 pub struct SSHAgent {
-    sock: UnixStream,
+    sock: RefCell<UnixStream>,
 }
 
 impl SSHAgent {
@@ -29,26 +41,27 @@ impl SSHAgent {
 
     /// Constructs a new SSHAgent from a given ssh-agent socket
     pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let sock = UnixStream::connect(path)?;
+        let sock = RefCell::new(UnixStream::connect(path)?);
         Ok(SSHAgent {
             sock
         })
     }
 
     /// List the keys that are currently loaded into the Agent
-    pub fn list_keys(&mut self) -> io::Result<(Vec<SSHKey>)> {
-        let mut keys: Vec<SSHKey> = Vec::new();
+    pub fn list_keys(&self) -> io::Result<(Vec<AgentIdentity>)> {
+        let mut keys: Vec<AgentIdentity> = Vec::new();
+        let mut sock_mut = self.sock.borrow_mut();
         // request the keys (uint32 + 1 byte content)
         let req = [0, 0, 0, 1, SSH_AGENTC_REQUEST_IDENTITIES];
-        self.sock.write_all(&req)?;
+        sock_mut.write_all(&req)?;
 
         // read the response
         let mut res = [0; 4];
-        self.sock.read_exact(&mut res)?;
+        sock_mut.read_exact(&mut res)?;
         let len = BigEndian::read_u32(&res);
 
         let mut buf = vec![0; len as usize];
-        self.sock.read_exact(&mut buf)?;
+        sock_mut.read_exact(&mut buf)?;
         match *buf.first().unwrap() {
             SSH_AGENT_IDENTITIES_ANSWER => Ok(()),
             SSH_AGENT_FAILURE =>
@@ -64,18 +77,19 @@ impl SSHAgent {
         for _ in 0..nkeys {
             let bytes = read_frame(&buf, &mut idx);
             let comment = read_frame(&buf, &mut idx);
-            keys.push(SSHKey::new(bytes, comment));
+            keys.push(AgentIdentity::new(bytes, comment));
         }
 
         Ok(keys)
     }
 
     /// Use the ssh-agent to sign some data with one of its keys
-    pub fn sign_data<R: Read>(&mut self, key: &SSHKey, mut data: R) -> io::Result<(String)> {
+    pub fn sign_data<R: Read>(&self, key: &AgentIdentity, mut data: R) -> io::Result<(String)> {
+        let mut sock_mut = self.sock.borrow_mut();
         // construct the request type + key blob
         let mut req = vec![0, 0, 0, 1, SSH_AGENTC_SIGN_REQUEST];
         let mut key_len = [0; 4];
-        BigEndian::write_u32(&mut key_len, key.pub_key.len()as u32);
+        BigEndian::write_u32(&mut key_len, key.pub_key().len()as u32);
 
         // attach the data being signed
         let mut data_len = [0; 4];
@@ -87,23 +101,23 @@ impl SSHAgent {
         BigEndian::write_u32(&mut flags, 0x02 as u32);
 
         // uint32 + op + uint32 + key length + uint32 + data length
-        let total = 4 + 1 + 4 + key.pub_key.len() + 4 + len;
+        let total = 4 + 1 + 4 + key.pub_key().len() + 4 + len;
         BigEndian::write_u32(&mut req[..4], total as u32);
         req.extend(&key_len);
-        req.extend(&key.pub_key);
+        req.extend(key.pub_key());
         req.extend(&data_len);
         req.append(&mut raw_data); // consume the vector instead and leave it empty
         req.extend(&flags);
 
         // write the data to the ssh-agent
-        self.sock.write_all(&req)?;
+        sock_mut.write_all(&req)?;
 
         // read the response
         let mut sign_res = [0; 4];
-        self.sock.read_exact(&mut sign_res)?;
+        sock_mut.read_exact(&mut sign_res)?;
         let sig_len = BigEndian::read_u32(&sign_res) as usize;
         let mut buf = vec![0; sig_len];
-        self.sock.read_exact(&mut buf)?;
+        sock_mut.read_exact(&mut buf)?;
         match *buf.first().unwrap() {
             SSH_AGENT_SIGN_RESPONSE => Ok(()),
             SSH_AGENT_FAILURE =>
